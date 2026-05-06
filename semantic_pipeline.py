@@ -21,8 +21,19 @@ def load_and_preprocess(filepath):
         pandas DataFrame with at least columns: 'text', plus any
         preprocessing columns you add (e.g., cleaned text).
     """
-    # TODO: Load the CSV, handle missing values, ensure text column is clean
-    pass
+    df = pd.read_csv(filepath)
+    # Drop rows with missing text
+    df = df.dropna(subset=["text"])
+    # Ensure text column is string type
+    df["text"] = df["text"].astype(str)
+    # Remove empty strings after conversion
+    df = df[df["text"].str.strip() != ""]
+    # Filter to English-language texts only (en_core_web_sm + distilbert-base-uncased
+    # are English models; Arabic rows produce poor results)
+    if "language" in df.columns:
+        df = df[df["language"] == "en"]
+    df = df.reset_index(drop=True)
+    return df
 
 
 def run_ner(texts):
@@ -35,9 +46,20 @@ def run_ner(texts):
         pandas DataFrame with columns: 'text_index', 'entity_text',
         'entity_label'. Each row is one extracted entity.
     """
-    # TODO: Load a spaCy model, process each text, extract entities,
-    #       and collect into a DataFrame
-    pass
+    nlp = spacy.load("en_core_web_sm")
+    rows = []
+    for idx, text in enumerate(texts):
+        doc = nlp(text)
+        for ent in doc.ents:
+            rows.append({
+                "text_index": idx,
+                "entity_text": ent.text,
+                "entity_label": ent.label_,
+            })
+    entity_df = pd.DataFrame(rows, columns=["text_index", "entity_text", "entity_label"])
+    # Ensure text_index is integer dtype as required by the autograder
+    entity_df["text_index"] = entity_df["text_index"].astype(int)
+    return entity_df
 
 
 def compute_embeddings(texts, tokenizer, model):
@@ -55,9 +77,27 @@ def compute_embeddings(texts, tokenizer, model):
         numpy array of shape (n_texts, 768).
     """
     import torch
-    # TODO: Iterate over texts, tokenize with padding/truncation,
-    #       run model forward pass (with torch.no_grad()), mean-pool hidden states
-    pass
+
+    embeddings = []
+    for text in texts:
+        encoded = tokenizer(
+            text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        with torch.no_grad():
+            outputs = model(**encoded)
+        # Mean-pool last hidden state weighted by attention mask
+        last_hidden = outputs.last_hidden_state  # (1, seq_len, 768)
+        mask = encoded["attention_mask"].unsqueeze(-1).float()  # (1, seq_len, 1)
+        summed = (last_hidden * mask).sum(dim=1)
+        counts = mask.sum(dim=1).clamp(min=1e-9)
+        mean_pooled = (summed / counts).squeeze(0).numpy()  # (768,)
+        embeddings.append(mean_pooled)
+
+    return np.array(embeddings)
 
 
 def semantic_search(query, corpus_embeddings, corpus_texts, top_k=5):
@@ -72,9 +112,17 @@ def semantic_search(query, corpus_embeddings, corpus_texts, top_k=5):
     Returns:
         List of (text, similarity_score) tuples, sorted by similarity descending.
     """
-    # TODO: Compute cosine similarity between query and all corpus embeddings,
-    #       sort by similarity, return top-k results
-    pass
+    # Normalize query vector
+    query_norm = query / (np.linalg.norm(query) + 1e-9)
+    # Normalize each corpus embedding
+    corpus_norms = np.linalg.norm(corpus_embeddings, axis=1, keepdims=True) + 1e-9
+    corpus_normalized = corpus_embeddings / corpus_norms
+    # Cosine similarities: dot product of normalized vectors
+    similarities = corpus_normalized.dot(query_norm)  # (n,)
+    # Get indices sorted by similarity descending
+    top_indices = np.argsort(similarities)[::-1][:top_k]
+    results = [(corpus_texts[i], float(similarities[i])) for i in top_indices]
+    return results
 
 
 def enrich_with_entities(search_results, entity_df, corpus_texts):
@@ -94,13 +142,30 @@ def enrich_with_entities(search_results, entity_df, corpus_texts):
         List of dictionaries, each with keys:
         'text', 'similarity', 'entities' (list of {'text': ..., 'label': ...}).
     """
-    # TODO: For each (text, score) in search_results, find the text's
-    #       position in corpus_texts (this is the text_index).
-    # TODO: Filter entity_df to rows where text_index matches, then build
-    #       a list of {'text': entity_text, 'label': entity_label} dicts.
-    # TODO: Return one dict per search result with keys text, similarity,
-    #       entities.
-    pass
+    enriched = []
+    for result_text, score in search_results:
+        # Map the result text back to its integer position in corpus_texts
+        try:
+            text_index = corpus_texts.index(result_text)
+        except ValueError:
+            text_index = -1
+
+        # Filter entity_df to rows matching this text_index
+        if text_index >= 0 and len(entity_df) > 0:
+            matching = entity_df[entity_df["text_index"] == text_index]
+            entities = [
+                {"text": row["entity_text"], "label": row["entity_label"]}
+                for _, row in matching.iterrows()
+            ]
+        else:
+            entities = []
+
+        enriched.append({
+            "text": result_text,
+            "similarity": score,
+            "entities": entities,
+        })
+    return enriched
 
 
 def demonstrate_pipeline(corpus_df, entity_df, embeddings, queries,
@@ -123,13 +188,17 @@ def demonstrate_pipeline(corpus_df, entity_df, embeddings, queries,
     Returns:
         Dictionary mapping each query string to its enriched results list.
     """
-    # TODO: For each query, compute the query embedding by calling
-    #       compute_embeddings([query], tokenizer, model)[0].
-    # TODO: Call semantic_search with the query embedding and the corpus.
-    # TODO: Call enrich_with_entities, passing corpus_df['text'].tolist()
-    #       as corpus_texts.
-    # TODO: Collect into a dict keyed by the query string and return it.
-    pass
+    corpus_texts = corpus_df["text"].tolist()
+    results = {}
+    for query in queries:
+        # Embed the query using the same mean-pooling pipeline
+        query_emb = compute_embeddings([query], tokenizer, model)[0]
+        # Retrieve top-5 semantically similar documents
+        search_results = semantic_search(query_emb, embeddings, corpus_texts)
+        # Attach NER entities to each result
+        enriched = enrich_with_entities(search_results, entity_df, corpus_texts)
+        results[query] = enriched
+    return results
 
 
 if __name__ == "__main__":
@@ -163,9 +232,29 @@ if __name__ == "__main__":
                 df, entities, embs, queries, tokenizer, model
             )
             if results:
+                # Build Markdown content
+                md_content = "# Semantic Pipeline Demo Results\n\n"
+                md_content += "## Summary\n\n"
+                md_content += f"- Loaded {len(texts)} texts\n"
+                md_content += f"- Extracted {len(entities)} entities\n"
+                md_content += f"- Embedding matrix shape: {embs.shape}\n\n"
+                
                 for q, enriched in results.items():
-                    print(f"\nQuery: {q}")
-                    for r in enriched[:3]:
-                        print(f"  Score: {r['similarity']:.4f}")
-                        print(f"  Text: {r['text'][:100]}...")
-                        print(f"  Entities: {r['entities'][:5]}")
+                    md_content += f"## Query: {q}\n\n"
+                    for i, r in enumerate(enriched, 1):
+                        md_content += f"### Result {i} | Score: {r['similarity']:.4f}\n\n"
+                        md_content += f"**Text:** {r['text'][:120]}...\n\n"
+                        top_entities = r['entities'][:5]
+                        if top_entities:
+                            ent_str = ", ".join(
+                                f"{e['text']} ({e['label']})" for e in top_entities
+                            )
+                            md_content += f"**Entities:** {ent_str}\n\n"
+                        else:
+                            md_content += "**Entities:** (none extracted)\n\n"
+                
+                # Write to file
+                with open("results.md", "w", encoding="utf-8") as f:
+                    f.write(md_content)
+                
+                print("Results saved to results.md")
